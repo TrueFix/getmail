@@ -30,3 +30,13 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Remove windows files
+*.cmd
+*.bat
+
+# Remove config dir
+config/
+
+# Remove third party dir
+maili/
