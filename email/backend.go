@@ -19,6 +19,7 @@ func (bkd *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 		State:           c,
 		OnEmailReceived: bkd.OnEmailReceived,
 		OnEmailFailed:   bkd.OnEmailFailed,
+		TrustedDomains:  bkd.TrustedDomains,
 	}, nil
 }
 

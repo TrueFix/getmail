@@ -38,7 +38,7 @@ func createTLSConfig() (*tls.Config, error) {
 func runSMTPServer() error {
 	tlsConfig, err := createTLSConfig()
 	if err != nil {
-		return err
+		log.Println("[WARN] TLS configuration not loaded:", err)
 	}
 
 	externalService := &service.Service{}
@@ -51,7 +51,10 @@ func runSMTPServer() error {
 
 	server := smtp.NewServer(backend)
 	server.Addr = "0.0.0.0:25"
-	server.TLSConfig = tlsConfig
+	if tlsConfig != nil {
+		server.TLSConfig = tlsConfig
+	}
+
 	server.WriteTimeout = 10 * time.Second
 	server.ReadTimeout = 10 * time.Second
 	server.MaxMessageBytes = 1024 * 1024
