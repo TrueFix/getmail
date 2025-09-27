@@ -6,8 +6,6 @@ import (
 	"net"
 	"strings"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 type Headers map[string]string
@@ -177,9 +175,10 @@ type Email struct {
 }
 
 func NewEmail() *Email {
+	uuid, _ := NewUUIDv7()
 	return &Email{
-		ID:         uuid.NewString(), // UUIDv4
-		ReceivedAt: time.Now(),       // Optional auto-initialized field
+		ID:         uuid.String(), // UUIDv7
+		ReceivedAt: time.Now(),    // Optional auto-initialized field
 	}
 }
 
