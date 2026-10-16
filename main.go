@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -72,6 +74,12 @@ func runSMTPServer(ctx context.Context, c Config) error {
 }
 
 func main() {
+	showVersion := flag.Bool("version", false, "Print the application version and exit")
+	flag.Parse()
+	if *showVersion {
+		fmt.Print(version)
+		return
+	}
 	c, err := loadConfig()
 	if err != nil {
 		log.Fatal(err)

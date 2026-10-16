@@ -1,5 +1,7 @@
 # SMTP Email Ingest Server
 
+**Version: v1.1.0** · [Changelog and migration notes](CHANGELOG.md)
+
 A small Go SMTP server that accepts messages, extracts headers, text/HTML bodies
 and attachments, and passes each message to an application handler.
 
@@ -16,10 +18,37 @@ Generate a local self-signed certificate:
 make ssl
 ```
 
+Certificate generation requires OpenSSL 1.1.1 or later. Existing certificate/key
+pairs are preserved; an incomplete pair produces an error. Generated private
+keys have mode `0600`. Certificates include the selected hostname, `localhost`,
+`127.0.0.1`, and `::1` as subject alternative names.
+
 Run with optional STARTTLS on port 2525:
 
 ```sh
 SMTP_ADDR=127.0.0.1:2525 go run .
+```
+
+The Makefile also passes its selected hostname and TLS paths to the application:
+
+```sh
+make ssl run DOMAIN=mail.example.com SMTP_ADDR=127.0.0.1:2525
+```
+
+`SMTP_DOMAIN`, `TLS_CERT_FILE`, and `TLS_KEY_FILE` can be supplied through the
+environment or as make arguments. `DOMAIN` is a shorthand for `SMTP_DOMAIN`
+when the latter is unset. Under make, certificate paths default to
+`config/<SMTP_DOMAIN>.crt` and `config/<SMTP_DOMAIN>.key`. Direct `go run .`
+continues to use the defaults in the configuration table below. Make does not
+automatically load `.env` files.
+
+Paths containing spaces are supported when quoted:
+
+```sh
+make ssl run SMTP_DOMAIN=mail.example.com \
+  TLS_CERT_FILE="config/local tls/server.crt" \
+  TLS_KEY_FILE="config/local tls/server.key" \
+  SMTP_ADDR=127.0.0.1:2525
 ```
 
 TLS-enabled modes fail at startup if the certificate cannot be loaded. For a
@@ -124,6 +153,192 @@ message limit.
 - `Recipients`: visible `To:` and `Cc:` header recipients.
 - `HELO` and `ClientIP`: connecting sender identity.
 
+## Accepting email in your own Go application
+
+Import `github.com/TrueFix/getmail/email` to use the parser and SMTP backend in
+your own program. The executable's `config.go` belongs to `package main`; an
+embedded application sets `email.Options` and `smtp.Server` fields itself.
+
+### 1. Complete local receiver
+
+After the `v1.1.0` Git tag is published, install the versioned module in your
+application:
+
+```sh
+go mod init example.com/mail-receiver
+go get github.com/TrueFix/getmail@v1.1.0
+```
+
+Save this as `main.go`. It accepts recipients at `example.test` over plaintext
+SMTP on localhost, prints the text body, and inspects attachment metadata:
+
+```go
+package main
+
+import (
+	"io"
+	"log"
+	"time"
+
+	"github.com/TrueFix/getmail/email"
+	"github.com/emersion/go-smtp"
+)
+
+func receiveEmail(message *email.Email) error {
+	log.Printf("ID=%s envelope=%s from=%s recipients=%v subject=%q",
+		message.ID, message.EnvelopeFrom.Email, message.From.Email,
+		message.RcptTo, message.Subject)
+	if message.BodyText != nil {
+		body, err := io.ReadAll(message.BodyText)
+		if err != nil {
+			return err
+		}
+		log.Printf("Text: %s", body)
+	}
+	for _, attachment := range message.Attachments {
+		log.Printf("Attachment: name=%q type=%s decoded-bytes=%d",
+			attachment.Filename(), attachment.ContentType(), attachment.Size)
+	}
+	// Persist or enqueue work before returning nil to acknowledge the message.
+	return nil
+}
+
+func receiveFailed(from email.EmailUser, to []email.EmailUser, raw io.Reader, err error) {
+	log.Printf("Message rejected: from=%s recipients=%v error=%v", from.Email, to, err)
+}
+
+func main() {
+	options := email.DefaultOptions()
+	options.SPFEnabled = false // No DNS checks for this local development example.
+	options.Limits.MaxAttachments = 3
+	options.Limits.MaxAttachmentSize = 2 * 1024 * 1024
+
+	backend := email.NewBackend(receiveEmail, receiveFailed, []string{"example.test"}, options)
+	server := smtp.NewServer(backend)
+	server.Addr = "127.0.0.1:2525"
+	server.Domain = "localhost"
+	server.MaxMessageBytes = options.Limits.MaxMessageBytes
+	server.MaxRecipients = 50
+	server.ReadTimeout = 30 * time.Second
+	server.WriteTimeout = 30 * time.Second
+
+	log.Printf("Example SMTP receiver listening on %s", server.Addr)
+	log.Fatal(server.ListenAndServe())
+}
+```
+
+Run `go mod tidy` and `go run .` in your application directory. The same example
+is included in this repository at [`examples/receive/main.go`](examples/receive/main.go):
+
+```sh
+go run ./examples/receive
+```
+
+Each connection has its own session. Different connections can invoke your
+handler concurrently, so shared application state must support concurrent use.
+Passing `nil` for trusted domains accepts recipients in any domain. Use
+`email.DefaultOptions()` before overriding individual settings; passing an
+`Options` value replaces the defaults rather than merging boolean settings.
+
+### 2. Read HTML and decoded attachment bytes
+
+Replace `receiveEmail` in the example with this callback when your integration
+needs HTML or the attachment contents. It uses the same `io` and `log` imports:
+
+```go
+func receiveEmail(message *email.Email) error {
+	if message.BodyHTML != nil {
+		body, err := io.ReadAll(message.BodyHTML)
+		if err != nil {
+			return err
+		}
+		log.Printf("HTML body: %s", body)
+	}
+	for _, attachment := range message.Attachments {
+		data, err := io.ReadAll(attachment)
+		if err != nil {
+			return err
+		}
+		log.Printf("Received %q: %d decoded bytes", attachment.Filename(), len(data))
+		// Pass data to your storage or processing code here.
+	}
+	return nil
+}
+```
+
+Bodies and attachments are consumable readers containing transfer-decoded
+bytes. Parser-created `EmailContent` values also support `Seek(0, io.SeekStart)`
+if you need to read them again. Original attachment filenames are metadata; use
+application-generated names when choosing storage paths.
+
+### 3. Store the original message as an `.eml` file
+
+Save this helper as `save.go` alongside the complete receiver. Call
+`return saveRawEmail(message, "messages")` from your callback to acknowledge a
+message only after writing the file and closing it successfully:
+
+The helper is also included at [`examples/receive/save.go`](examples/receive/save.go).
+
+```go
+package main
+
+import (
+	"errors"
+	"io"
+	"os"
+
+	"github.com/TrueFix/getmail/email"
+)
+
+func saveRawEmail(message *email.Email, directory string) error {
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		return err
+	}
+	file, err := os.CreateTemp(directory, message.ID+"-*.eml")
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(file, message.Raw)
+	closeErr := file.Close()
+	if err := errors.Join(copyErr, closeErr); err != nil {
+		_ = os.Remove(file.Name())
+		return err
+	}
+	return nil
+}
+```
+
+This stores the original headers, encoded bodies, and attachments as one file.
+For stronger durability guarantees, use your application's durable queue or
+storage transaction. The message ID identifies this reception, so a sender
+retry can have a new ID.
+
+### 4. Enable STARTTLS in an embedded server
+
+Add `crypto/tls` to the complete example's imports. Before constructing the
+backend, require an encrypted SMTP transaction:
+
+```go
+options.RequireTLS = true
+```
+
+After constructing `server`, configure its certificate before listening:
+
+```go
+certificate, err := tls.LoadX509KeyPair("server.crt", "server.key")
+if err != nil {
+	log.Fatal(err)
+}
+server.TLSConfig = &tls.Config{
+	Certificates: []tls.Certificate{certificate},
+	MinVersion:   tls.VersionTLS12,
+}
+```
+
+Set `RequireTLS` to false if plaintext SMTP should also be accepted while
+STARTTLS is available. Options are copied into the backend at construction;
+configure them before calling `email.NewBackend`.
+
 ## SPF and dependencies
 
 SPF evaluates the envelope sender, falling back to HELO for null senders. The
@@ -146,10 +361,45 @@ library.
 ## Development checks
 
 ```sh
-go test -race ./...
-go vet ./...
+make help    # List targets
+make build   # Build bin/getmail; BUILD_DIR can override bin
+make test    # go test -race ./...
+make vet     # go vet ./...
+make fmt     # Format Go sources
+make version # Print v1.1.0 without loading certificates or starting SMTP
+make clean   # Delete the executable, preserving certificates
 ```
+
+To replace generated certificates, explicitly remove the selected pair first:
+
+```sh
+make clean-ssl DOMAIN=mail.example.com
+make ssl DOMAIN=mail.example.com DAYS_VALID=365
+```
+
+`clean-ssl` deletes only the selected key/certificate paths. Development targets
+add no Go dependencies; certificate tooling uses OpenSSL and standard Unix tools.
 
 Regression tests cover persistent SMTP connections and resets, handler failures,
 null senders, MIME decoding, attachment boundaries, malformed content, SPF with
 an in-memory DNS resolver, configuration validation, and required STARTTLS.
+
+## Versioning
+
+[`VERSION`](VERSION) is the application version source, currently **v1.1.0**.
+The value is embedded into builds and can be checked with:
+
+```sh
+go run . --version
+# Or after make build:
+./bin/getmail --version
+```
+
+Git tags identify published Go module versions; `go.mod` declares the module
+path and Go toolchain requirement, not the repository's release number. Keep
+`VERSION`, the release heading in `CHANGELOG.md`, and the release Git tag in
+sync. A `v1.1.0` tag must point to a commit containing these changes and be
+pushed before remote consumers can install `@v1.1.0`.
+
+See [the v1.1.0 migration notes](CHANGELOG.md#migrating-from-v101) for the
+error-returning callback and other upgrade changes from v1.0.1.

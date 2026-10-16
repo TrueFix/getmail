@@ -1,65 +1,75 @@
-DOMAIN       := localhost
-KEY_FILE     := config/$(DOMAIN).key
-CERT_FILE    := config/$(DOMAIN).crt
-CONFIG_FILE  := config/openssl-san.cnf
-DAYS_VALID   := 365
-
 SHELL := /bin/bash
+.SHELLFLAGS := -eu -o pipefail -c
+.DEFAULT_GOAL := help
 
-.PHONY: help ssl clean
+# DOMAIN remains a convenient shorthand; application environment settings win.
+DOMAIN ?= localhost
+SMTP_DOMAIN ?= $(DOMAIN)
+TLS_KEY_FILE ?= config/$(SMTP_DOMAIN).key
+TLS_CERT_FILE ?= config/$(SMTP_DOMAIN).crt
+DAYS_VALID ?= 365
+BUILD_DIR ?= bin
 
-help: ## Show this help menu
-	@echo "Usage: make [TARGET ...]"
-	@echo ""
-	@grep --no-filename -E '^[a-zA-Z_%-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
-		awk 'BEGIN {FS = ":.*?## "}; {printf "%-25s %s\n", $$1, $$2}'
+export SMTP_DOMAIN TLS_KEY_FILE TLS_CERT_FILE DAYS_VALID BUILD_DIR
 
-ssl: ## Generate a self-signed SSL certificate with SAN for $(DOMAIN)
-	@echo "🔐 Generating self-signed SSL certificate for $(DOMAIN)..."
+.PHONY: help ssl clean-ssl run build test vet fmt version clean
 
-	@echo "📁 Creating config directory if it doesn't exist..."
-	mkdir -p config
+help: ## Show available commands
+	@printf '%s\n' 'Usage: make [TARGET] [VARIABLE=value ...]' ''
+	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z_-]+:.*## / {printf "  %-12s %s\n", $$1, $$2}' "$(firstword $(MAKEFILE_LIST))"
+	@printf '\n%s\n' 'Example: make ssl run DOMAIN=mail.example.com SMTP_ADDR=127.0.0.1:2525'
 
-	@echo "Generating private key..."
-	openssl genrsa -out $(KEY_FILE) 2048
+ssl: ## Generate a self-signed certificate; preserve an existing pair
+	@if [[ -e "$$TLS_KEY_FILE" || -L "$$TLS_KEY_FILE" || -e "$$TLS_CERT_FILE" || -L "$$TLS_CERT_FILE" ]]; then \
+		if [[ -f "$$TLS_KEY_FILE" && -f "$$TLS_CERT_FILE" ]]; then \
+			printf '%s\n' 'Keeping existing TLS key and certificate.'; \
+			exit 0; \
+		fi; \
+		printf '%s\n' 'TLS output already exists without a complete file pair; use different paths or explicitly remove it.' >&2; \
+		exit 1; \
+	fi; \
+	if [[ "$$TLS_KEY_FILE" == "$$TLS_CERT_FILE" ]]; then \
+		printf '%s\n' 'TLS_KEY_FILE and TLS_CERT_FILE must be different paths.' >&2; exit 1; \
+	fi; \
+	command -v openssl >/dev/null; \
+	umask 077; \
+	mkdir -p -- "$$(dirname -- "$$TLS_KEY_FILE")" "$$(dirname -- "$$TLS_CERT_FILE")"; \
+	tmp="$$(mktemp -d)"; \
+	trap 'rm -rf -- "$$tmp"' EXIT; \
+	san="DNS:$$SMTP_DOMAIN,IP:127.0.0.1,IP:::1"; \
+	if [[ "$$SMTP_DOMAIN" != localhost ]]; then san="$$san,DNS:localhost"; fi; \
+	openssl req -x509 -newkey rsa:2048 -nodes -sha256 \
+		-days "$$DAYS_VALID" -subj "/CN=$$SMTP_DOMAIN" \
+		-addext "subjectAltName=$$san" \
+		-addext 'basicConstraints=critical,CA:FALSE' \
+		-addext 'keyUsage=critical,digitalSignature,keyEncipherment' \
+		-addext 'extendedKeyUsage=serverAuth' \
+		-keyout "$$tmp/key.pem" -out "$$tmp/cert.pem"; \
+	install -m 600 -- "$$tmp/key.pem" "$$TLS_KEY_FILE"; \
+	install -m 644 -- "$$tmp/cert.pem" "$$TLS_CERT_FILE"; \
+	printf 'Certificate: %s\nPrivate key: %s\n' "$$TLS_CERT_FILE" "$$TLS_KEY_FILE"
 
-	@echo "⚙️ Creating OpenSSL config with SAN..."
-	@echo "[req]" > $(CONFIG_FILE)
-	@echo "default_bits = 2048" >> $(CONFIG_FILE)
-	@echo "prompt = no" >> $(CONFIG_FILE)
-	@echo "default_md = sha256" >> $(CONFIG_FILE)
-	@echo "req_extensions = req_ext" >> $(CONFIG_FILE)
-	@echo "distinguished_name = dn" >> $(CONFIG_FILE)
-	@echo "" >> $(CONFIG_FILE)
-	@echo "[dn]" >> $(CONFIG_FILE)
-	@echo "CN = $(DOMAIN)" >> $(CONFIG_FILE)
-	@echo "" >> $(CONFIG_FILE)
-	@echo "[req_ext]" >> $(CONFIG_FILE)
-	@echo "subjectAltName = @alt_names" >> $(CONFIG_FILE)
-	@echo "" >> $(CONFIG_FILE)
-	@echo "[alt_names]" >> $(CONFIG_FILE)
-	@echo "DNS.1 = $(DOMAIN)" >> $(CONFIG_FILE)
-	@echo "DNS.2 = www.$(DOMAIN)" >> $(CONFIG_FILE)
-	@echo "DNS.3 = mail.$(DOMAIN)" >> $(CONFIG_FILE)
-	@echo "DNS.4 = smtp.$(DOMAIN)" >> $(CONFIG_FILE)
-	@echo "DNS.5 = imap.$(DOMAIN)" >> $(CONFIG_FILE)
-	@echo "DNS.6 = pop3.$(DOMAIN)" >> $(CONFIG_FILE)
-	@echo "DNS.7 = localhost" >> $(CONFIG_FILE)
+clean-ssl: ## Explicitly delete the selected TLS key and certificate
+	rm -f -- "$$TLS_KEY_FILE" "$$TLS_CERT_FILE"
 
-	@echo "Creating self-signed certificate..."
-	openssl req -x509 -days $(DAYS_VALID) \
-		-key $(KEY_FILE) \
-		-out $(CERT_FILE) \
-		-subj "/CN=$(DOMAIN)" \
-		-config $(CONFIG_FILE) \
-		-extensions req_ext
-	
-	@echo "✅ Self-signed certificate and key generated:"
-	@echo "   - Certificate: $(CERT_FILE)"
-	@echo "   - Key:         $(KEY_FILE)"
+run: ## Run the server using the selected hostname and certificate paths
+	go run .
 
+build: ## Build bin/getmail (override BUILD_DIR to change the directory)
+	mkdir -p -- "$$BUILD_DIR"
+	go build -o "$$BUILD_DIR/getmail" .
 
-clean: ## Clean up generated files
-	@echo "🧹 Cleaning generated files..."
-	rm -f $(KEY_FILE) $(CERT_FILE) $(CONFIG_FILE)
-	@echo "Done."
+test: ## Run tests with the race detector
+	go test -race ./...
+
+vet: ## Run Go static analysis
+	go vet ./...
+
+fmt: ## Format Go source files
+	gofmt -w *.go email service examples
+
+version: ## Print the application version without starting the server
+	@go run . --version
+
+clean: ## Delete the built executable; preserve TLS files
+	rm -f -- "$$BUILD_DIR/getmail"
