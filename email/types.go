@@ -3,7 +3,9 @@ package email
 import (
 	"fmt"
 	"io"
+	"mime"
 	"net"
+	"net/textproto"
 	"strings"
 	"time"
 )
@@ -11,7 +13,10 @@ import (
 type Headers map[string]string
 
 func (h Headers) GetValue(key string) string {
-	value := h[key]
+	if value, ok := h[key]; ok {
+		return value
+	}
+	value := h[textproto.CanonicalMIMEHeaderKey(key)]
 	return value
 }
 
@@ -25,27 +30,11 @@ func (h Headers) GetFirst(key string) string {
 }
 
 func (h Headers) GetParam(headerKey, paramKey string) string {
-	value, ok := h[headerKey]
-	if !ok {
+	_, params, err := mime.ParseMediaType(h.GetValue(headerKey))
+	if err != nil {
 		return ""
 	}
-
-	parts := strings.SplitSeq(value, ";")
-
-	for part := range parts {
-		pair := strings.SplitN(part, "=", 2)
-		if len(pair) != 2 {
-			// LogInfo("GetParam", fmt.Sprintf("Skipping malformed parameter in header: %q", part))
-			continue
-		}
-		key := strings.TrimSpace(pair[0])
-		val := strings.Trim(strings.TrimSpace(pair[1]), `"`)
-		if key == paramKey {
-			return val
-		}
-	}
-
-	return ""
+	return params[strings.ToLower(paramKey)]
 }
 
 func (h Headers) GetString(key string) string {
@@ -65,7 +54,7 @@ func (rp *EmailContent) Filename() string {
 	if disposition != "" {
 		return disposition
 	}
-	return ""
+	return rp.Headers.ContentType.Params["name"]
 }
 
 func (rp *EmailContent) ContentType() string {
@@ -82,17 +71,24 @@ func (rp *EmailContent) Read(p []byte) (n int, err error) {
 	return rp.R.Read(p)
 }
 
+func (rp *EmailContent) Seek(offset int64, whence int) (int64, error) {
+	if seeker, ok := rp.R.(io.Seeker); ok {
+		return seeker.Seek(offset, whence)
+	}
+	return 0, fmt.Errorf("email content is not seekable")
+}
+
 type EmailUser struct {
 	Name  string `json:"Name,omitempty"`  // Name is the display name of the user.
 	Email string `json:"Email,omitempty"` // Email is the email address of the user.
 }
 
 func (eu EmailUser) HasDomain(domains []string) (string, bool) {
-	parts := strings.SplitN(eu.Email, "@", 2)
-	if len(parts) != 2 {
+	at := strings.LastIndexByte(eu.Email, '@')
+	if at < 0 {
 		return "", false
 	}
-	domain := parts[1]
+	domain := eu.Email[at+1:]
 	for _, d := range domains {
 		if strings.EqualFold(d, domain) {
 			return domain, true
@@ -144,6 +140,10 @@ type Email struct {
 	// From is the email address of the sender.
 	From EmailUser
 
+	// EnvelopeFrom is the SMTP MAIL FROM identity (empty for a bounce).
+	EnvelopeFrom EmailUser
+	HELO         string
+
 	// Recipients is a list of email addresses of the recipients like To, Cc and Bcc.
 	RcptTo []EmailUser
 
@@ -169,9 +169,11 @@ type Email struct {
 	Attachments []*EmailContent
 
 	// Verification checks
-	SPF   bool // SPF check result
-	DKIM  bool // DKIM check result
-	DMARC bool // DMARC check result
+	SPF       bool   // SPF check result
+	SPFResult string // Full SPF result; empty when not checked.
+	spfError  error
+	DKIM      bool // DKIM check result
+	DMARC     bool // DMARC check result
 }
 
 func NewEmail() *Email {
@@ -180,19 +182,4 @@ func NewEmail() *Email {
 		ID:         uuid.String(), // UUIDv7
 		ReceivedAt: time.Now(),    // Optional auto-initialized field
 	}
-}
-
-func (e *Email) VerifySPF() (bool, error) {
-	// check if we already have the result
-	if e.SPF {
-		return e.SPF, nil
-	}
-
-	if e.ClientIP == nil || e.From.Email == "" {
-		return false, nil // Cannot verify SPF without client IP or sender email
-	}
-	domain := strings.SplitN(e.From.Email, "@", 2)[1]
-
-	spfRecord := NewSPFRecord(domain)
-	return spfRecord.CheckSPF(domain, e.ClientIP)
 }

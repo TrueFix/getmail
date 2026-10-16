@@ -9,7 +9,8 @@ import (
 // Backend implements the SMTP backend.
 type Backend struct {
 	TrustedDomains  []string
-	OnEmailReceived func(email *Email)
+	Options         Options
+	OnEmailReceived func(email *Email) error
 	OnEmailFailed   func(from EmailUser, to []EmailUser, raw io.Reader, err error)
 }
 
@@ -20,15 +21,22 @@ func (bkd *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 		OnEmailReceived: bkd.OnEmailReceived,
 		OnEmailFailed:   bkd.OnEmailFailed,
 		TrustedDomains:  bkd.TrustedDomains,
+		Options:         bkd.Options,
 	}, nil
 }
 
 func NewBackend(
-	OnEmailReceived func(email *Email),
+	OnEmailReceived func(email *Email) error,
 	OnEmailFailed func(from EmailUser, to []EmailUser, raw io.Reader, err error),
 	TrustedDomains []string,
+	options ...Options,
 ) *Backend {
+	opts := DefaultOptions()
+	if len(options) > 0 {
+		opts = options[0]
+	}
 	return &Backend{
+		Options:         opts,
 		OnEmailReceived: OnEmailReceived,
 		OnEmailFailed:   OnEmailFailed,
 		TrustedDomains:  TrustedDomains,

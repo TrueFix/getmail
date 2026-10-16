@@ -5,349 +5,256 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/mail"
 	"net/textproto"
-	"regexp"
 	"strings"
 )
 
+// Limits apply to one message. Attachment size is the decoded size in bytes.
+type Limits struct {
+	MaxMessageBytes   int64
+	MaxAttachments    int
+	MaxAttachmentSize int64
+	MaxMIMEParts      int
+}
+
+func DefaultLimits() Limits {
+	return Limits{25 * 1024 * 1024, 10, 10 * 1024 * 1024, 1000}
+}
+
+var ErrLimitExceeded = errors.New("message limit exceeded")
+
 func parseHeaders(h map[string][]string) Headers {
 	headers := make(Headers)
-	for k, v := range h {
-		if len(v) == 0 {
-			continue
-		}
-		if len(v) == 1 {
-			v = splitAndTrim(v[0], ";")
-		}
-		headers[textproto.CanonicalMIMEHeaderKey(k)] = strings.Join(v, "; ")
+	for key, values := range h {
+		headers[textproto.CanonicalMIMEHeaderKey(key)] = strings.Join(values, "; ")
 	}
 	return headers
 }
 
 func parseEmailUser(input string) (EmailUser, error) {
-	input = strings.TrimSpace(input)
-	if input == "" {
-		return EmailUser{}, fmt.Errorf("input cannot be empty")
+	a, err := mail.ParseAddress(strings.TrimSpace(input))
+	if err != nil {
+		return EmailUser{}, err
 	}
-
-	// Remove "TO:" prefix if present
-	if strings.HasPrefix(strings.ToUpper(input), "TO:") {
-		input = strings.TrimSpace(input[3:])
-	}
-
-	// Common patterns to match:
-	// 1. "Name" <email@domain>
-	// 2. Name <email@domain>
-	// 3. <email@domain>
-	// 4. email@domain
-
-	// Try #1 and #2
-	re1 := regexp.MustCompile(`^"?([^"<@]+)?"?\s*<([^<>@\s]+@[^<>@\s]+)>$`)
-	if matches := re1.FindStringSubmatch(input); len(matches) == 3 {
-		name := strings.Trim(matches[1], `" `)
-		email := strings.TrimSpace(matches[2])
-		return EmailUser{Name: name, Email: email}, nil
-	}
-
-	// Try #3
-	re2 := regexp.MustCompile(`^<([^<>@\s]+@[^<>@\s]+)>$`)
-	if matches := re2.FindStringSubmatch(input); len(matches) == 2 {
-		return EmailUser{Name: "", Email: strings.TrimSpace(matches[1])}, nil
-	}
-
-	// Try #4 (just plain email)
-	re3 := regexp.MustCompile(`^([^<>@\s]+@[^<>@\s]+)$`)
-	if matches := re3.FindStringSubmatch(input); len(matches) == 2 {
-		return EmailUser{Name: "", Email: strings.TrimSpace(matches[1])}, nil
-	}
-
-	return EmailUser{}, fmt.Errorf("could not parse email line: %s", input)
+	return EmailUser{Name: a.Name, Email: a.Address}, nil
 }
 
 func parseEmailUsers(input []string) ([]EmailUser, error) {
 	var users []EmailUser
-	for _, line := range input {
-		email, err := parseEmailUser(line)
+	for _, value := range input {
+		addresses, err := mail.ParseAddressList(value)
 		if err != nil {
 			return nil, err
 		}
-		users = append(users, email)
+		for _, address := range addresses {
+			users = append(users, EmailUser{Name: address.Name, Email: address.Address})
+		}
 	}
 	return users, nil
 }
 
 func parseContentType(value string) (HeaderContentType, error) {
-	var ct HeaderContentType
-	ct.Params = make(Headers)
-
-	parts := strings.Split(value, ";")
-	media := strings.SplitN(strings.TrimSpace(parts[0]), "/", 2)
-	if len(media) != 2 {
-		return ct, fmt.Errorf("invalid media type: %s", value)
+	if value == "" {
+		value = "text/plain; charset=us-ascii"
 	}
-	ct.MediaType = strings.TrimSpace(media[0])
-	ct.SubType = strings.TrimSpace(media[1])
-
-	for _, param := range parts[1:] {
-		pair := strings.SplitN(param, "=", 2)
-		if len(pair) != 2 {
-			LogInfo("parseContentType", fmt.Sprintf("malformed parameter in header: %q", param))
-			continue
-		}
-		key := strings.TrimSpace(pair[0])
-		val := strings.Trim(strings.TrimSpace(pair[1]), `"`)
-		ct.Params[key] = val
+	mediaType, params, err := mime.ParseMediaType(value)
+	if err != nil {
+		return HeaderContentType{}, err
 	}
-
-	return ct, nil
+	parts := strings.SplitN(mediaType, "/", 2)
+	if len(parts) != 2 {
+		return HeaderContentType{}, fmt.Errorf("invalid media type %q", mediaType)
+	}
+	return HeaderContentType{MediaType: parts[0], SubType: parts[1], Params: Headers(params)}, nil
 }
 
 func parseEmailContentHeader(header map[string][]string) (EmailContentHeader, error) {
-	headers := EmailContentHeader{
-		Extra: make(Headers),
+	h := textproto.MIMEHeader(header)
+	ct, err := parseContentType(h.Get("Content-Type"))
+	if err != nil {
+		return EmailContentHeader{}, fmt.Errorf("invalid Content-Type: %w", err)
 	}
+	extra := parseHeaders(header)
+	delete(extra, "Content-Type")
+	delete(extra, "Content-Transfer-Encoding")
+	delete(extra, "Mime-Version")
+	return EmailContentHeader{
+		ContentType: ct, ContentTransferEncoding: h.Get("Content-Transfer-Encoding"),
+		MimeVersion: h.Get("Mime-Version"), Extra: extra,
+	}, nil
+}
 
-	lines := []string{}
-	for k, v := range header {
-		lines = append(lines, fmt.Sprintf("%s: %s", k, strings.Join(v, "; ")))
+func parseMimeHeaderLines(header map[string][]string) (*MimeHeaders, error) {
+	h := textproto.MIMEHeader(header)
+	content, err := parseEmailContentHeader(header)
+	if err != nil {
+		return nil, err
 	}
-
-	for _, line := range lines {
-		line := strings.TrimSpace(line)
-		parts := strings.SplitN(line, ":", 2)
-
-		if len(parts) != 2 {
-			LogInfo("parseEmailContentHeader", fmt.Sprintf("Skipping malformed header line: %s, Length: %d", line, len(parts)))
-			continue
+	subject, err := new(mime.WordDecoder).DecodeHeader(h.Get("Subject"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid Subject: %w", err)
+	}
+	headers := &MimeHeaders{
+		Subject: subject, Date: h.Get("Date"), MimeVersion: content.MimeVersion,
+		ContentType: content.ContentType, ContentTransferEncoding: content.ContentTransferEncoding,
+		Extra: content.Extra,
+	}
+	if value := h.Get("From"); value != "" {
+		headers.From, err = parseEmailUser(value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid From: %w", err)
 		}
-		key := strings.TrimSpace(parts[0])
-		value := strings.TrimSpace(parts[1])
-
-		switch textproto.CanonicalMIMEHeaderKey(key) {
-		case "Content-Transfer-Encoding":
-			headers.ContentTransferEncoding = value
-		case "Content-Type":
-			// Parse Content-Type and parameters
-			ct, err := parseContentType(value)
-			if err != nil {
-				LogInfo("parseEmailContentHeader", fmt.Sprintf("Skipping malformed Content-Type header: %s", value))
-				continue
-			}
-			headers.ContentType = ct
-		case "Mime-Version":
-			headers.MimeVersion = value
-		default:
-			headers.Extra[key] = value
-		}
+	}
+	headers.To, err = parseEmailUsers(h.Values("To"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid To: %w", err)
+	}
+	headers.Cc, err = parseEmailUsers(h.Values("Cc"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid Cc: %w", err)
+	}
+	for _, key := range []string{"From", "To", "Cc", "Subject", "Date"} {
+		delete(headers.Extra, key)
 	}
 	return headers, nil
 }
 
-func parseMimeHeaderLines(header map[string][]string) (*MimeHeaders, error) {
-	headers := MimeHeaders{
-		Extra: make(Headers),
+// readBounded detects overflow without trusting advertised sizes or allocating
+// based on an attacker-controlled MIME header.
+func readBounded(r io.Reader, limit int64) ([]byte, error) {
+	b, err := io.ReadAll(io.LimitReader(r, limit))
+	if err != nil {
+		return b, err
 	}
-
-	lines := []string{}
-	for k, v := range header {
-		lines = append(lines, fmt.Sprintf("%s: %s", k, strings.Join(v, "; ")))
+	var extra [1]byte
+	n, err := io.ReadFull(r, extra[:])
+	if n > 0 {
+		return b, ErrLimitExceeded
 	}
-
-	for _, line := range lines {
-		line := strings.TrimSpace(line)
-		parts := strings.SplitN(line, ":", 2)
-
-		if len(parts) != 2 {
-			LogInfo("parseMimeHeaderLines", fmt.Sprintf("Skipping malformed header line: %s, Length: %d", line, len(parts)))
-			continue
-		}
-		key := strings.TrimSpace(parts[0])
-		value := strings.TrimSpace(parts[1])
-
-		switch textproto.CanonicalMIMEHeaderKey(key) {
-		case "Mime-Version":
-			headers.MimeVersion = value
-		case "Date":
-			headers.Date = value
-		case "Subject":
-			headers.Subject = value
-		case "From":
-			fromUser, err := parseEmailUser(value)
-			if err != nil {
-				return nil, errors.New("smtp: error parsing from header")
-			}
-			headers.From = fromUser
-
-		case "To":
-			toUsers, err := parseEmailUsers(strings.Split(value, ","))
-			if err != nil {
-				return nil, errors.New("smtp: error parsing to header")
-			}
-			headers.To = toUsers
-
-		case "Cc":
-			ccUsers, err := parseEmailUsers(strings.Split(value, ","))
-			if err != nil {
-				return nil, errors.New("smtp: error parsing cc header")
-			}
-			headers.Cc = ccUsers
-
-		case "Content-Transfer-Encoding":
-			headers.ContentTransferEncoding = value
-
-		case "Content-Type":
-			// Parse Content-Type and parameters
-			ct, err := parseContentType(value)
-			if err != nil {
-				LogInfo("parseMimeHeaderLines", fmt.Sprintf("Skipping malformed Content-Type header: %s", value))
-				continue
-			}
-			headers.ContentType = ct
-
-		default:
-			headers.Extra[key] = value
-		}
-
+	if err != nil && err != io.EOF {
+		return b, err
 	}
-
-	return &headers, nil
+	return b, nil
 }
 
-func parseBody(h *MimeHeaders, b []byte) (*EmailContent, *EmailContent, []*EmailContent, error) {
-	var (
-		bodyText    *EmailContent
-		bodyHTML    *EmailContent
-		attachments []*EmailContent
-	)
+type bodyParser struct {
+	limits      Limits
+	parts       int
+	text, html  *EmailContent
+	attachments []*EmailContent
+}
 
-	if strings.HasPrefix(h.ContentType.MediaType, "multipart") {
+func (p *bodyParser) parse(header map[string][]string, r io.Reader, depth int) error {
+	p.parts++
+	if depth > 30 || p.parts > p.limits.MaxMIMEParts {
+		return fmt.Errorf("%w: too many MIME parts or nesting levels", ErrLimitExceeded)
+	}
+	h, err := parseEmailContentHeader(header)
+	if err != nil {
+		return err
+	}
+	disposition := ""
+	var params map[string]string
+	if value := h.Extra.GetString("Content-Disposition"); value != "" {
+		disposition, params, err = mime.ParseMediaType(value)
+		if err != nil {
+			return fmt.Errorf("invalid Content-Disposition: %w", err)
+		}
+	}
+	isAttachment := disposition == "attachment" || params["filename"] != "" || h.ContentType.Params["name"] != ""
+	if h.ContentType.MediaType == "multipart" && !isAttachment {
 		boundary := h.ContentType.Params["boundary"]
 		if boundary == "" {
-			return nil, nil, nil, errors.New("multipart content type missing boundary parameter")
+			return errors.New("multipart content type missing boundary")
 		}
-
-		for part, err := range MultipartIterator(bytes.NewReader(b), boundary) {
+		mr := multipart.NewReader(r, boundary)
+		for {
+			// NextRawPart avoids implicit quoted-printable decoding; all leaf
+			// transfer encodings are decoded exactly once below.
+			part, err := mr.NextRawPart()
+			if err == io.EOF {
+				return nil
+			}
 			if err != nil {
-				LogInfo("parseBody", fmt.Sprintf("error iterating multipart: %v", err))
-				continue
+				return fmt.Errorf("read multipart: %w", err)
 			}
-			h, err := parseEmailContentHeader(part.Header)
-			if err != nil {
-				LogInfo("parseBody", fmt.Sprintf("error parsing part headers %v", err))
-				continue
+			if part.Header.Get("Content-Type") == "" && h.ContentType.SubType == "digest" {
+				part.Header.Set("Content-Type", "message/rfc822")
 			}
-			data, err := io.ReadAll(part)
-			if err != nil {
-				LogInfo("parseBody", fmt.Sprintf("error reading part data %v", err))
-				continue
+			if err := p.parse(part.Header, part, depth+1); err != nil {
+				return err
 			}
-
-			if h.ContentTransferEncoding != "" {
-				data, err = decodeData(data, h.ContentTransferEncoding)
-				if err != nil {
-					LogInfo("parseBody", fmt.Sprintf("error decoding part data %v", err))
-					continue
-				}
-			}
-
-			// LogInfo("parseBody", fmt.Sprintf("Part content type: %s/%s, size: %d bytes", h.ContentType.MediaType, h.ContentType.SubType, len(data)))
-
-			if len(part.Header) == 0 {
-				LogInfo("parseBody", "skipping part with empty headers")
-				continue
-			}
-
-			if h.ContentType.MediaType == "text" && h.ContentType.SubType == "plain" {
-				bodyText = &EmailContent{
-					R:       bytes.NewReader(data),
-					Headers: h,
-					Size:    int64(len(data)),
-				}
-			} else if h.ContentType.MediaType == "text" && h.ContentType.SubType == "html" {
-				bodyHTML = &EmailContent{
-					R:       bytes.NewReader(data),
-					Headers: h,
-					Size:    int64(len(data)),
-				}
-			} else {
-				attachments = append(attachments, &EmailContent{
-					R:       bytes.NewReader(data),
-					Headers: h,
-					Size:    int64(len(data)),
-				})
+			if err := part.Close(); err != nil {
+				return err
 			}
 		}
-	} else if h.ContentType.MediaType == "text" && h.ContentType.SubType == "plain" {
-		bodyText = &EmailContent{
-			R:       bytes.NewReader(b),
-			Headers: EmailContentHeader{},
-			Size:    int64(len(b)),
-		}
-	} else if h.ContentType.MediaType == "text" && h.ContentType.SubType == "html" {
-		bodyHTML = &EmailContent{
-			R:       bytes.NewReader(b),
-			Headers: EmailContentHeader{},
-			Size:    int64(len(b)),
-		}
-	} else {
-		LogInfo("parseBody", fmt.Sprintf("Unhandled singlepart content type: %s/%s", h.ContentType.MediaType, h.ContentType.SubType))
-		return nil, nil, nil, fmt.Errorf("unhandled singlepart content type: %s/%s", h.ContentType.MediaType, h.ContentType.SubType)
 	}
-
-	return bodyText, bodyHTML, attachments, nil
-
+	isBody := h.ContentType.MediaType == "text" && (h.ContentType.SubType == "plain" || h.ContentType.SubType == "html") && !isAttachment
+	limit := p.limits.MaxMessageBytes
+	if !isBody {
+		if len(p.attachments) >= p.limits.MaxAttachments {
+			return fmt.Errorf("%w: maximum %d attachments", ErrLimitExceeded, p.limits.MaxAttachments)
+		}
+		limit = p.limits.MaxAttachmentSize
+	}
+	decoded, err := decodingReader(r, h.ContentTransferEncoding)
+	if err != nil {
+		return err
+	}
+	data, err := readBounded(decoded, limit)
+	if err != nil {
+		return fmt.Errorf("read MIME content (limit %d bytes): %w", limit, err)
+	}
+	content := &EmailContent{R: bytes.NewReader(data), Headers: h, Size: int64(len(data))}
+	if !isBody {
+		p.attachments = append(p.attachments, content)
+	} else if h.ContentType.SubType == "plain" {
+		p.text = content
+	} else {
+		p.html = content
+	}
+	return nil
 }
 
 func parseEmail(r io.Reader) (*Email, error) {
-	rawEmail, err := io.ReadAll(r)
-	// LogInfo("parseEmail", fmt.Sprintf("[Raw Email Data]\n\n%s\n\n", string(rawEmail)))
-	if err != nil {
-		return nil, fmt.Errorf("parseEmail: failed to read raw email: %w", err)
+	return parseEmailWithLimits(r, DefaultLimits())
+}
+
+func parseEmailWithLimits(r io.Reader, limits Limits) (*Email, error) {
+	if limits.MaxMessageBytes <= 0 || limits.MaxAttachmentSize <= 0 || limits.MaxAttachments < 0 || limits.MaxMIMEParts <= 0 {
+		return nil, errors.New("invalid parser limits")
 	}
-
-	msg, err := mail.ReadMessage(bytes.NewReader(rawEmail))
+	raw, err := readBounded(r, limits.MaxMessageBytes)
 	if err != nil {
-		return nil, fmt.Errorf("parseEmail: failed to read message: %w", err)
+		return nil, fmt.Errorf("read message: %w", err)
 	}
+	return parseRawEmail(raw, limits)
+}
 
-	hdr, bdy := msg.Header, msg.Body
-	bdyBytes, err := io.ReadAll(bdy)
+func parseRawEmail(raw []byte, limits Limits) (*Email, error) {
+	msg, err := mail.ReadMessage(bytes.NewReader(raw))
 	if err != nil {
-		return nil, fmt.Errorf("parseEmail: failed to read body: %w", err)
+		return nil, fmt.Errorf("read message headers: %w", err)
 	}
-
-	// Parse headers
-	headers, err := parseMimeHeaderLines(hdr)
+	headers, err := parseMimeHeaderLines(msg.Header)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse headers: %w", err)
+		return nil, err
 	}
-
-	// Combine recipients (cc + to + from) into a flat list
-	recipients := append([]EmailUser{}, headers.Cc...)
-	recipients = append(recipients, headers.To...)
-
-	// Parse body based on Content-Type
-	bt, bh, atts, err := parseBody(headers, bdyBytes)
+	body, err := io.ReadAll(msg.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse body: %w", err)
+		return nil, err
 	}
-
-	// Construct the Email object
-	email := NewEmail()
-	email.From = headers.From
-	email.RcptTo = recipients
-	email.Subject = headers.Subject
-
-	email.Headers = headers
-
-	email.Raw = bytes.NewReader(rawEmail)
-	email.Body = bytes.NewReader(bdyBytes)
-
-	email.BodyText = bt
-	email.BodyHTML = bh
-
-	email.Attachments = atts
-
-	return email, nil
+	p := bodyParser{limits: limits}
+	if err := p.parse(msg.Header, bytes.NewReader(body), 0); err != nil {
+		return nil, err
+	}
+	e := NewEmail()
+	e.From, e.Subject, e.Headers = headers.From, headers.Subject, headers
+	e.Recipients = append(append([]EmailUser{}, headers.To...), headers.Cc...)
+	e.Raw, e.Body = bytes.NewReader(raw), bytes.NewReader(body)
+	e.BodyText, e.BodyHTML, e.Attachments = p.text, p.html, p.attachments
+	return e, nil
 }

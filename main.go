@@ -1,71 +1,84 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
+	"errors"
 	"log"
 	"os"
-	"time"
+	"os/signal"
+	"syscall"
 
 	"github.com/TrueFix/getmail/email"
 	"github.com/TrueFix/getmail/service"
 	"github.com/emersion/go-smtp"
 )
 
-// createTLSConfig loads TLS certificates and returns the TLS config.
-func createTLSConfig() (*tls.Config, error) {
-	// Check if cert files exist
-	if _, err := os.Stat("config/localhost.crt"); err == nil {
-		if _, err := os.Stat("config/localhost.key"); err != nil {
-			return nil, err
-		}
-	} else {
-		return nil, err
+func createTLSConfig(c Config) (*tls.Config, error) {
+	if c.TLSMode == "off" {
+		return nil, nil
 	}
-
-	// Load cert and key
-	cert, err := tls.LoadX509KeyPair("config/localhost.crt", "config/localhost.key")
+	cert, err := tls.LoadX509KeyPair(c.TLSCertFile, c.TLSKeyFile)
 	if err != nil {
 		return nil, err
 	}
-
-	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		ServerName:   "localhost",
-	}, nil
+	return &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}, nil
 }
 
-// runSMTPServer sets up and starts the SMTP server.
-func runSMTPServer() error {
-	tlsConfig, err := createTLSConfig()
+func newSMTPServer(c Config) (*smtp.Server, error) {
+	tlsConfig, err := createTLSConfig(c)
 	if err != nil {
-		log.Println("[WARN] TLS configuration not loaded:", err)
+		return nil, err
 	}
-
 	externalService := &service.Service{}
-
-	backend := email.NewBackend(
-		externalService.OnEmail,
-		externalService.OnEmailFailed,
-		[]string{}, // Trusted domains
-	)
-
+	backend := email.NewBackend(externalService.OnEmail, externalService.OnEmailFailed, c.TrustedDomains, email.Options{
+		Limits: email.Limits{
+			MaxMessageBytes: c.MaxMessageBytes, MaxAttachments: c.MaxAttachments,
+			MaxAttachmentSize: c.MaxAttachmentSize, MaxMIMEParts: c.MaxMIMEParts,
+		},
+		RequireTLS: c.TLSMode == "required", SPFEnabled: c.SPFEnabled, SPFTimeout: c.SPFTimeout,
+	})
 	server := smtp.NewServer(backend)
-	server.Addr = "0.0.0.0:25"
-	if tlsConfig != nil {
-		server.TLSConfig = tlsConfig
+	server.Addr = c.SMTPAddr
+	server.Domain = c.SMTPDomain
+	server.TLSConfig = tlsConfig
+	server.WriteTimeout = c.WriteTimeout
+	server.ReadTimeout = c.ReadTimeout
+	server.MaxMessageBytes = c.MaxMessageBytes
+	server.MaxRecipients = c.MaxRecipients
+	return server, nil
+}
+
+func runSMTPServer(ctx context.Context, c Config) error {
+	server, err := newSMTPServer(c)
+	if err != nil {
+		return err
 	}
-
-	server.WriteTimeout = 10 * time.Second
-	server.ReadTimeout = 10 * time.Second
-	server.MaxMessageBytes = 1024 * 1024
-	server.MaxRecipients = 50
-
-	log.Println("[INFO] SMTP server listening on", server.Addr)
-	return server.ListenAndServe()
+	done := make(chan error, 1)
+	go func() { done <- server.ListenAndServe() }()
+	log.Printf("[INFO] SMTP listening on %s (TLS mode: %s)", c.SMTPAddr, c.TLSMode)
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), c.ShutdownTimeout)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			_ = server.Close()
+			return err
+		}
+		return nil
+	}
 }
 
 func main() {
-	if err := runSMTPServer(); err != nil {
-		log.Fatal("[FATAL]", err)
+	c, err := loadConfig()
+	if err != nil {
+		log.Fatal(err)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := runSMTPServer(ctx, c); err != nil && !errors.Is(err, smtp.ErrServerClosed) {
+		log.Fatal("[FATAL] ", err)
 	}
 }

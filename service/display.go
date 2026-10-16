@@ -21,11 +21,7 @@ func logEmailMetadata(e *email.Email) {
 		len(e.Attachments),
 	)
 
-	if spf, err := e.VerifySPF(); err != nil {
-		log.Printf("[WARNING] SPF verification failed: %v", err)
-	} else {
-		log.Printf("[INFO] SPF verified: %v", spf)
-	}
+	log.Printf("[INFO] Envelope sender: %s; SPF result: %s", e.EnvelopeFrom.Email, e.SPFResult)
 }
 
 // logEmailHeaders logs detailed headers of the email.
@@ -69,7 +65,15 @@ func logEmailBodies(e *email.Email) {
 
 // previewBody reads and returns the first 100 bytes of a body.
 func previewBody(r io.Reader) ([]byte, error) {
-	body, err := io.ReadAll(r)
+	// Preserve seekable body readers for subsequent application processing.
+	if seeker, ok := r.(io.Seeker); ok {
+		offset, err := seeker.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return nil, err
+		}
+		defer seeker.Seek(offset, io.SeekStart)
+	}
+	body, err := io.ReadAll(io.LimitReader(r, 100))
 	if err != nil {
 		return nil, err
 	}

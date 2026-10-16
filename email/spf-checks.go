@@ -1,133 +1,40 @@
 package email
 
 import (
-	"fmt"
-	"log"
-	"net"
-	"strings"
+	"context"
+	"time"
+
+	"blitiri.com.ar/go/spf"
 )
 
-// IpRange holds IPv4 and IPv6 CIDR ranges.
-type SPFRecord struct {
-	Domain string
-	ipv4   *map[string]struct{}
-	ipv6   *map[string]struct{}
+// VerifySPF checks the SMTP envelope identity, never the visible From header.
+func (e *Email) VerifySPF() (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return e.VerifySPFContext(ctx)
 }
 
-func NewSPFRecord(domain string) *SPFRecord {
-	return &SPFRecord{
-		Domain: domain,
-		ipv4:   &map[string]struct{}{},
-		ipv6:   &map[string]struct{}{},
+func (e *Email) VerifySPFContext(ctx context.Context, options ...spf.Option) (bool, error) {
+	if e.SPFResult != "" {
+		return e.SPF, e.spfError
 	}
-}
-
-func (r *SPFRecord) Add(ipv4 []string, ipv6 []string) {
-	for _, ip := range ipv4 {
-		(*r.ipv4)[ip] = struct{}{}
+	if e.ClientIP == nil || (e.EnvelopeFrom.Email == "" && e.HELO == "") {
+		return false, nil
 	}
-	for _, ip := range ipv6 {
-		(*r.ipv6)[ip] = struct{}{}
+	sender := e.EnvelopeFrom.Email
+	if sender == "" {
+		sender = "postmaster@" + e.HELO
 	}
-}
-
-func (r *SPFRecord) CheckIfContains(ip net.IP) bool {
-	for cidr := range *r.ipv4 {
-		if _, ipnet, err := net.ParseCIDR(cidr); err == nil && ipnet.Contains(ip) {
-			return true
-		}
+	options = append(options, spf.WithContext(ctx))
+	result, reason := spf.CheckHostWithSender(e.ClientIP, e.HELO, sender, options...)
+	if ctx.Err() != nil {
+		result, reason = spf.TempError, ctx.Err()
 	}
-	for cidr := range *r.ipv6 {
-		if _, ipnet, err := net.ParseCIDR(cidr); err == nil && ipnet.Contains(ip) {
-			return true
-		}
+	e.SPFResult, e.SPF = string(result), result == spf.Pass
+	// The library also returns diagnostic match reasons on successful checks.
+	if result == spf.TempError || result == spf.PermError {
+		e.spfError = reason
+		return false, reason
 	}
-	return false
-}
-
-func (r *SPFRecord) CheckSPF(domain string, ip net.IP) (bool, error) {
-	err := r.fetchSPFNetworks(domain, make(map[string]struct{}))
-	if err != nil {
-		return false, fmt.Errorf("error fetching SPF records: %w", err)
-	}
-	return r.CheckIfContains(ip), nil
-}
-
-// fetchSPFNetworks recursively fetches and resolves SPF records for a domain.
-func (r *SPFRecord) fetchSPFNetworks(domain string, visited map[string]struct{}) error {
-	if _, seen := visited[domain]; seen {
-		return nil // Avoid recursion
-	}
-	visited[domain] = struct{}{}
-
-	txtRecords, err := net.LookupTXT(domain)
-	if err != nil {
-		return fmt.Errorf("TXT lookup failed for %s: %w", domain, err)
-	}
-
-	var allIPv4, allIPv6 []string
-	for _, record := range txtRecords {
-		if !strings.HasPrefix(record, "v=spf1") {
-			continue
-		}
-
-		ipv4, ipv6, includes, redirects := r.parseSPFRecord(record)
-		allIPv4 = append(allIPv4, ipv4...)
-		allIPv6 = append(allIPv6, ipv6...)
-
-		for _, inc := range includes {
-			err := r.fetchSPFNetworks(inc, visited)
-			if err != nil {
-				log.Printf("Include failed for %s: %v", inc, err)
-				continue
-			}
-		}
-
-		for _, red := range redirects {
-			err := r.fetchSPFNetworks(red, visited)
-			if err != nil {
-				log.Printf("Redirect failed for %s: %v", red, err)
-				continue
-			}
-		}
-	}
-	r.Add(allIPv4, allIPv6)
-
-	return nil
-
-}
-
-// parseSPFRecord extracts IPs, includes, and redirects from an SPF record.
-func (r *SPFRecord) parseSPFRecord(spf string) (ipv4 []string, ipv6 []string, includes []string, redirects []string) {
-	spf = r.normalizeSPF(spf)
-	parts := strings.Fields(spf)
-
-	for _, part := range parts {
-		switch {
-		case strings.HasPrefix(part, "ip4:"):
-			ip := strings.TrimPrefix(part, "ip4:")
-			ipv4 = append(ipv4, ip)
-		case strings.HasPrefix(part, "ip6:"):
-			ip := strings.TrimPrefix(part, "ip6:")
-			ipv6 = append(ipv6, ip)
-		case strings.HasPrefix(part, "include:"):
-			domain := strings.TrimPrefix(part, "include:")
-			includes = append(includes, domain)
-		case strings.HasPrefix(part, "redirect="):
-			domain := strings.TrimPrefix(part, "redirect=")
-			redirects = append(redirects, domain)
-		}
-	}
-	return
-}
-
-// normalizeSPF removes the 'v=spf1' prefix and any terminal 'all' mechanism.
-func (r *SPFRecord) normalizeSPF(spf string) string {
-	spf = strings.TrimPrefix(spf, "v=spf1")
-	spf = strings.TrimSpace(spf)
-	spf = strings.TrimSuffix(spf, "~all")
-	spf = strings.TrimSuffix(spf, "-all")
-	spf = strings.TrimSuffix(spf, "+all")
-	spf = strings.TrimSuffix(spf, "?all")
-	return strings.TrimSpace(spf)
+	return e.SPF, nil
 }

@@ -9,10 +9,11 @@ import (
 
 type Service struct{}
 
-func (m *Service) OnEmail(email *email.Email) {
+func (m *Service) OnEmail(email *email.Email) error {
 	logEmailMetadata(email)
 	logEmailHeaders(email)
 	logEmailBodies(email)
+	return nil
 }
 
 func (m *Service) OnEmailFailed(from email.EmailUser, to []email.EmailUser, raw io.Reader, err error) {
